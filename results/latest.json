@@ -1,0 +1,103 @@
+{
+  "generated_utc": "2026-10-10T07:39:47Z",
+  "command": "python tools/run_benchmark.py --require python,cpp,simd,mind,cuda --note 'desktop x86-64 CPU with AVX2 and a consumer NVIDIA GPU; the machine was shared with other heavy jobs during the run (load average above the core count), so p50 times are inflated and the best batch is the better estimate' -o results/latest.json",
+  "model": {
+    "file": "nikola_d12v2_gold.nknn",
+    "sha256": "041BC71A527B830E54A83664BD7B2C4414A9F047348943DF2CE3359B49142E3C",
+    "bytes": 20989768
+  },
+  "config": {
+    "batch": 1000,
+    "warmup": 10,
+    "iters": 50,
+    "seed": 42
+  },
+  "reference_checksum": "0x0613C9FD",
+  "environment": {
+    "os": "Linux x86_64",
+    "python": "3.14.7",
+    "numpy": "2.5.3",
+    "cxx": "c++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+    "cmake": "cmake version 4.2.3",
+    "nvcc": "Cuda compilation tools, release 13.4, V13.4.92",
+    "mindc": "mind 0.10.2"
+  },
+  "note": "desktop x86-64 CPU with AVX2 and a consumer NVIDIA GPU; the machine was shared with other heavy jobs during the run (load average above the core count), so p50 times are inflated and the best batch is the better estimate",
+  "results": [
+    {
+      "id": "python",
+      "implementation": "Python reference",
+      "device": "CPU",
+      "min_ms": 162.88,
+      "p50_ms": 727.784,
+      "p95_ms": 2265.804,
+      "mean_ms": 966.054,
+      "throughput_pos_per_s": 6139.5,
+      "status": "verified",
+      "checksum": "0x0613C9FD",
+      "bit_identical": true,
+      "max_abs_diff": 0.0,
+      "timing_scope": "batched NumPy forward pass, inputs already packed in memory"
+    },
+    {
+      "id": "cpp",
+      "implementation": "C++ scalar",
+      "device": "CPU",
+      "min_ms": 24.438,
+      "p50_ms": 173.738,
+      "p95_ms": 1275.687,
+      "mean_ms": 336.837,
+      "throughput_pos_per_s": 40919.6,
+      "status": "verified",
+      "checksum": "0x0613C9FD",
+      "bit_identical": true,
+      "max_abs_diff": 0.0,
+      "timing_scope": "per-position forward pass in C++, inputs already in memory"
+    },
+    {
+      "id": "simd",
+      "implementation": "C++ AVX2",
+      "device": "CPU",
+      "min_ms": 4.51,
+      "p50_ms": 10.077,
+      "p95_ms": 128.043,
+      "mean_ms": 27.548,
+      "throughput_pos_per_s": 221721.7,
+      "status": "verified",
+      "checksum": "0x0613C9FD",
+      "bit_identical": true,
+      "max_abs_diff": 0.0,
+      "timing_scope": "per-position forward pass in C++, inputs already in memory"
+    },
+    {
+      "id": "mind",
+      "implementation": "MIND",
+      "device": "CPU",
+      "min_ms": 161.107,
+      "p50_ms": 1742.017,
+      "p95_ms": 4350.662,
+      "mean_ms": 1851.728,
+      "throughput_pos_per_s": 6207.0,
+      "status": "verified",
+      "checksum": "0x0613C9FD",
+      "bit_identical": true,
+      "max_abs_diff": 0.0,
+      "timing_scope": "one MIND call per batch (all positions, all outputs), via ctypes"
+    },
+    {
+      "id": "cuda",
+      "implementation": "CUDA",
+      "device": "GPU",
+      "min_ms": 0.279,
+      "p50_ms": 0.477,
+      "p95_ms": 24.906,
+      "mean_ms": 11.188,
+      "throughput_pos_per_s": 3584088.4,
+      "status": "verified",
+      "checksum": "0x0613C9FD",
+      "bit_identical": true,
+      "max_abs_diff": 0.0,
+      "timing_scope": "host-to-device input copy + kernels + device-to-host trace copy"
+    }
+  ]
+}

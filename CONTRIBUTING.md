@@ -1,73 +1,44 @@
 # Contributing to nnue-inference-bench
 
-## Development Setup
-
-1. Clone the repository
-2. Install dependencies: `pip install numpy`
-3. Run smoke test: `python tools/smoke_cpu.py`
-4. Run benchmark: `python bench/runner.py --batch 100 --iters 3`
-
-## Code Structure
-
-- `tools/` - Core Python implementation
-- `bench/` - Benchmark runner and results
-- `native-cuda/` - CUDA kernels (optional)
-- `docs/` - Documentation
-
-## Running Tests
+## Setup
 
 ```bash
-# Smoke test (CI)
+python -m pip install numpy
 python tools/smoke_cpu.py
-
-# Quick benchmark
-python bench/runner.py --batch 100 --warmup 2 --iters 3
-
-# Full benchmark
-python bench/runner.py --batch 1000 --warmup 5 --iters 20
+cmake -S native-cpp -B native-cpp/build -DCMAKE_BUILD_TYPE=Release
+cmake --build native-cpp/build --config Release
 ```
 
-## Regenerating Documentation
-
-After running benchmarks, update docs from JSON:
+## Checks before a pull request
 
 ```bash
-python tools/update_docs.py
+python tools/run_benchmark.py --impl python,cpp,simd --require python,cpp,simd -o build/work/results.json
+python tools/validate_results.py build/work/results.json
+python tools/update_docs.py --check
 ```
 
-This updates AUTO sections in README.md from `bench/results/LATEST_NNUE.json`.
+If you have the toolchains, also run the MIND and CUDA paths
+(`python tools/run_benchmark.py` runs everything available).
 
-## Adding New Features
+## Rules
 
-### Adding a New Kernel
+- Every implementation follows the numerics contract in
+  [docs/BENCHMARK.md](docs/BENCHMARK.md) and must stay bit-identical to the reference.
+- If you deliberately change the reference (`tools/infer_cpu.py`), update the pinned
+  checksums in `tools/smoke_cpu.py` and `tools/validate_results.py` in the same change
+  and say why.
+- README numbers come only from `results/latest.json` via `python tools/update_docs.py`.
+  To publish new numbers, run `tools/run_benchmark.py -o results/latest.json` with a
+  `--note` describing the hardware class, then regenerate the table.
 
-1. Implement in `native-cuda/nnue_kernels.cu`
-2. Add wrapper in `tools/infer_gpu.py`
-3. Add benchmark case in `bench/runner.py`
-4. Update `docs/ARCHITECTURE.md`
+## Adding an implementation
 
-### Adding a New Benchmark Tier
+1. Consume the packed inputs (`tools/infer_cpu.py:pack_inputs`) and produce the
+   float32 `[N, 68]` trace.
+2. Add a runner to `RUNNERS` and `NAMES` in `tools/run_benchmark.py`.
+3. Document how it meets the numerics contract in `docs/BENCHMARK.md`.
 
-1. Add timing function in `bench/runner.py`
-2. Update JSON schema in `bench/result_schema.json`
-3. Update `tools/update_docs.py` to render new tier
-4. Document in `docs/BENCHMARK.md`
+## Code style
 
-## Code Style
-
-- Python: Follow PEP 8
-- Use type hints where practical
-- Keep functions focused and documented
-
-## Submitting Changes
-
-1. Create a feature branch
-2. Run tests: `python tools/smoke_cpu.py`
-3. Run benchmark and update docs
-4. Verify no uncommitted changes after: `python tools/update_docs.py`
-5. Create pull request
-
-## Golden Vector Test
-
-The smoke test uses a fixed input (seed=42) with expected checksum 0xFD4B38E9.
-If inference changes, update the expected checksum in `tools/smoke_cpu.py`.
+Python: PEP 8 with type hints. C++: C++17, no compiler-specific extensions outside
+the AVX2 intrinsics file.

@@ -1,94 +1,52 @@
-# Benchmark Methodology
+# Benchmark methodology
 
-This document defines the benchmark tiers, metrics, and reproducibility requirements.
+## Inputs
 
-## Benchmark Tiers
+- Model: `models/nikola_d12v2_gold.nknn` (SHA-256 checked by `tools/smoke_cpu.py`).
+- Positions: position `i` of a batch is generated from
+  `numpy.random.default_rng(seed + i)` (`tools/infer_cpu.py:create_random_position`).
+  Default batch 1000, seed 42.
+- Features: HalfKP indices, packed once by `pack_inputs` into int32 rows of 64 slots:
+  `[stm, n_white, n_black, 30 white slots, 30 black slots, pad]`. The C++ binaries
+  read the same rows from a file written by `write_inputs`; the MIND and CUDA paths
+  receive them through ctypes.
 
-### Tier A — Micro (Kernel Only)
+## Numerics contract
 
-Measures pure inference kernel performance, excluding I/O and feature extraction.
+IEEE-754 binary32; every multiply and every add is rounded on its own (no fused
+multiply-add); dense sums are accumulated in input-index order starting from the
+bias. How each path honours it:
 
-- **Input**: Pre-extracted features already in memory
-- **Measured**: Forward pass only (sparse accumulation + dense layers)
-- **Excludes**: Model loading, feature extraction, position parsing
+| Path | Mechanism |
+|---|---|
+| Python | separate NumPy float32 multiply and add per input index |
+| C++ scalar | plain loops, `-ffp-contract=off` (`/fp:precise` on MSVC) |
+| C++ AVX2 | vectorised across output neurons with `_mm256_mul_ps` + `_mm256_add_ps`, no FMA |
+| CUDA | `__fmul_rn` / `__fadd_rn`, built with `--fmad=false` |
+| MIND | f64 arithmetic rounded to f32 after every operation |
 
-Use case: Comparing kernel implementations (CUDA vs Mind GPU vs CPU SIMD)
+The L1 accumulation is exact in any order (all values are multiples of 1/128 and far
+below the float32 integer range), so only the dense layers depend on the order.
 
-### Tier B — End-to-End
+## Verification
 
-Measures complete inference pipeline including feature extraction.
+Each path returns a 68-value float32 trace per position: eval, three WDL logits, the
+32 L2 pre-activations and the 32 L3 pre-activations. `run_benchmark.py` compares every
+trace with the Python reference bit for bit and records the MD5-based checksum.
+`validate_results.py` also pins the reference checksum per (batch, seed), so a change
+in the reference itself (an edit, or a NumPy/platform difference) fails CI.
 
-- **Input**: Board positions (piece placement + side-to-move)
-- **Measured**: Feature extraction + forward pass
-- **Excludes**: Model loading (amortized across batch)
+A path is `verified` only when its trace is bit-identical; otherwise it is a
+`mismatch` and the run fails.
 
-Use case: Real-world throughput comparison
+## Timing
 
-## Required Metrics
-
-Every benchmark row MUST report:
-
-| Metric | Description | Example |
-|--------|-------------|---------|
-| `implementation` | Code path being measured | `Python reference`, `Mind CPU`, `CUDA DLL` |
-| `device` | Hardware target | `CPU`, `GPU` |
-| `tier` | Benchmark tier | `A` or `B` |
-| `batch` | Positions per batch | `1000` |
-| `warmup` | Warmup iterations | `10` |
-| `iters` | Measured iterations | `50` |
-| `p50_ms` | Median batch time | `2.245` |
-| `p95_ms` | 95th percentile batch time | `2.793` |
-| `throughput` | Positions per second | `445345` |
-| `checksum` | Deterministic output hash | `0x6C1B4100` |
-
-## Checksum Requirement
-
-All implementations MUST produce identical checksums for the same input positions.
-
-```
-Checksum algorithm:
-1. For each position, get float32 evaluation score
-2. Quantize: int32_value = round(score * 10000)
-3. XOR all int32 values together
-4. Report as hex: 0x{checksum:08X}
-```
-
-If checksums don't match, the implementation is WRONG, not just "different."
-
-## Reproducibility
-
-### Seed Consistency
-
-All benchmarks use `seed=42` for position generation. Same seed = same positions = same checksum.
-
-### Hardware Reporting
-
-Results JSON must include:
-- CPU model
-- GPU model (if applicable)
-- OS and version
-- Python/compiler version
-
-### Canonical Output
-
-Results are stored in `bench/results/LATEST_NNUE.json` with full metadata.
-
-## Implementation Status
-
-| Implementation | Tier A | Tier B | Checksum Verified |
-|----------------|--------|--------|-------------------|
-| Python reference (CPU) | — | ✅ | ✅ 0x6C1B4100 |
-| C++ baseline (CPU) | — | ✅ | ✅ 0x6C1B4100 |
-| CUDA DLL (GPU) | — | ✅ | ✅ 0x6C1B4100 |
-| Mind CPU | — | 🔲 | 🔲 |
-| Mind GPU (MIC) | — | 🔲 | 🔲 |
-
-## Winner Determination
-
-The "winner" is determined by **throughput at Tier B** with matching checksum.
-
-```
-Winner = max(throughput) WHERE checksum = reference_checksum
-```
-
-No checksum match = disqualified.
+- Warmup iterations are run and discarded, then each measured iteration times one
+  full batch with a monotonic clock.
+- Throughput = batch size / fastest measured batch. p50, p95 and mean are recorded
+  too; on a shared machine the minimum is the least disturbed measurement.
+- What a batch covers differs by path and is stored as `timing_scope` in the JSON:
+  in-memory forward passes for Python and C++, one ctypes call per batch for MIND,
+  and input upload + kernels + trace download for CUDA.
+- Results record software versions only (OS, Python, NumPy, compilers, `mindc`);
+  hardware is described in the free-text `note`.

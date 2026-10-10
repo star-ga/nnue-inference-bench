@@ -1,129 +1,43 @@
 # Architecture
 
-This document describes the architecture of nnue-inference-bench.
+## Data flow
 
-## Overview
+```
+seeded positions -> HalfKP features -> packed int32 rows ──┬─> Python reference (NumPy)
+   (tools/infer_cpu.py)                                     ├─> C++ scalar / AVX2   (file)
+                                                            ├─> MIND kernel         (ctypes)
+                                                            └─> CUDA kernels        (ctypes)
+                                            each path -> float32 trace [N, 68] -> compare
+```
 
-nnue-inference-bench is a standalone benchmark for NNUE neural network inference,
-specifically designed for the NikolaChess NKNN v2 model format.
+`tools/run_benchmark.py` drives every path, compares each trace with the reference,
+and writes one results JSON. `tools/update_docs.py` renders the README table from
+`results/latest.json`.
+
+## Network
+
+```
+HalfKP features (40960 per perspective)
+  L1  sparse 40960 -> 256 per perspective   W1 i16, B1 i16, scale 128
+      SCReLU, concatenate [side to move, other side] -> 512
+  L2  dense 512 -> 32, SCReLU               W2 i8 (scale 64), B2 i16 (scale 128)
+  L3  dense 32 -> 32, SCReLU                W3 i8, B3 i16
+  heads  eval 32 -> 1, WDL 32 -> 3          W4/W_wdl i8, B4/B_wdl i16
+```
+
+SCReLU(x) = clamp(x, 0, 1)^2. The binary layout is in [`include/nknn_v2.md`](../include/nknn_v2.md).
 
 ## Components
 
-```
-nnue-inference-bench/
-├── bench/                  # Benchmark runner
-│   ├── runner.py          # Main benchmark CLI
-│   ├── results/           # Output JSON files
-│   │   ├── LATEST_NNUE.json
-│   │   └── raw/           # Timestamped copies
-│   └── result_schema.json # JSON schema
-├── tools/                  # Core implementation
-│   ├── inspect_nknn.py    # NKNN loader + inspector
-│   ├── infer_cpu.py       # CPU reference inference
-│   ├── infer_gpu.py       # GPU inference (stub)
-│   ├── smoke_cpu.py       # CI smoke test
-│   └── update_docs.py     # AUTO doc generator
-├── native-cuda/            # CUDA kernels (optional)
-│   └── nnue_kernels.cu    # Sparse accumulation + dense layers
-├── models/                 # NKNN model files
-│   └── nikola_d12v2_gold.nknn
-├── include/                # Specifications
-│   └── nknn_v2.md         # NKNN binary format spec
-└── docs/                   # Documentation
-    ├── BENCHMARK.md
-    └── ARCHITECTURE.md
-```
-
-## Data Flow
-
-```
-Position → Feature Extraction → Sparse Accumulation → Dense Layers → Eval
-   │              │                    │                  │           │
-   │        HalfKP encoding       First layer         L2,L3,L4      Score
-   │        40960 indices         40960→256           256→32→1
-```
-
-## Module Responsibilities
-
-### inspect_nknn.py (Model Loader)
-
-- Parses NKNN v2 binary format
-- Validates magic number and version
-- Dequantizes weights (cached_property for performance)
-- Computes SHA-256 for provenance
-
-### infer_cpu.py (CPU Inference)
-
-- HalfKP feature extraction
-- Sparse accumulation (vectorized with NumPy)
-- Dense layer forward pass
-- SCReLU activation
-
-### infer_gpu.py (GPU Inference)
-
-- GPU detection via nvidia-smi
-- Native CUDA kernel loading (ctypes)
-- Graceful fallback with documented reason
-
-### runner.py (Benchmark Harness)
-
-- Position generation (deterministic seed)
-- Warmup + measured iterations
-- Timing with perf_counter_ns / perf_counter
-- JSON output with raw data
-
-### update_docs.py (Doc Generator)
-
-- Reads LATEST_NNUE.json
-- Updates README.md AUTO sections
-- Never recalculates benchmark values
-
-## Neural Network Architecture
-
-```
-Input: HalfKP features (40960 per perspective)
-       │
-       ▼
-┌─────────────────────────────────────┐
-│ L1 (Sparse): 40960 → 256 per side   │ i16 weights, scale 128
-│ Activation: SCReLU                   │
-└─────────────────────────────────────┘
-       │ Concatenate [white, black] or [black, white] based on STM
-       ▼
-┌─────────────────────────────────────┐
-│ L2 (Dense): 512 → 32                │ i8 weights, scale 64
-│ Activation: SCReLU                   │
-└─────────────────────────────────────┘
-       │
-       ▼
-┌─────────────────────────────────────┐
-│ L3 (Dense): 32 → 32                 │ i8 weights, scale 64
-│ Activation: SCReLU                   │
-└─────────────────────────────────────┘
-       │
-       ▼
-┌─────────────────────────────────────┐
-│ L4 (Dense): 32 → 1                  │ Eval head
-└─────────────────────────────────────┘
-```
-
-## GPU Implementation Status
-
-| Component | Status | Notes |
-|-----------|--------|-------|
-| CUDA kernels | Written | Requires MSVC + CUDA toolkit to compile |
-| Python wrapper | Stub | Gracefully reports blocked_reason |
-| Benchmark integration | Ready | Falls back to CPU |
-
-To enable GPU:
-1. Install CUDA toolkit and Visual Studio
-2. Run: `nvcc -shared -o native-cuda/nnue_kernels.dll native-cuda/nnue_kernels.cu`
-3. Re-run benchmark
-
-## Design Decisions
-
-1. **Python reference first**: Correctness > performance for baseline
-2. **Graceful GPU fallback**: Never crash if GPU unavailable
-3. **Canonical JSON**: Single source of truth for all docs
-4. **Deterministic checksums**: Prevent benchmark drift
-5. **Cached properties**: 1000x speedup for weight access
+| File | Role |
+|---|---|
+| `tools/inspect_nknn.py` | NKNN v2 loader and inspector (dequantised weights, SHA-256) |
+| `tools/infer_cpu.py` | reference forward pass, position generator, input packing, checksum |
+| `tools/infer_mind.py` | builds `mind/nnue.mind` with `mindc --emit-shared`, calls it via ctypes |
+| `tools/infer_gpu.py` | loads `native-cuda` library via ctypes; weights resident on the device |
+| `tools/run_benchmark.py` | runs, verifies and times every path; writes the results JSON |
+| `tools/validate_results.py` | CI gate: pinned reference checksum, every path bit-identical |
+| `tools/update_docs.py` | README results table from a results JSON (`--check` for CI) |
+| `native-cpp/` | `bench_cpu` (scalar) and `bench_simd` (AVX2) from one driver |
+| `native-cuda/` | L1 and dense kernels plus a C ABI for ctypes |
+| `mind/nnue.mind` | the full forward pass in MIND |

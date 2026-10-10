@@ -11,7 +11,7 @@ It is the **single source of truth** for all loaders, exporters, and validators.
 | Version | 2 |
 | Endianness | Little-endian |
 | Alignment | Tightly packed (no padding) |
-| Total Size | 20,989,768 bytes |
+| Data Size | 20,989,712 bytes (header + tensors) |
 
 ## Network Architecture
 
@@ -105,7 +105,7 @@ Offset      Size (bytes)    Field
 0x0140470A  6               B_wdl[3] as i16 (3 * 2)
 
 --------------------------------------------------------------
-Total:      20,989,768 bytes (0x01404710)
+End of data: 20,989,712 bytes (0x01404710)
 ```
 
 ## Size Calculation
@@ -123,10 +123,12 @@ B4:       1 * 2       =          2
 W_wdl:   32 * 3 * 1   =         96
 B_wdl:    3 * 2       =          6
 ---------------------------------
-Total:                = 20,989,708 bytes + 8 header = 20,989,716 bytes
+Tensors:              = 20,989,704 bytes + 8 header = 20,989,712 bytes
 ```
 
-Note: Actual file size may include alignment padding at end.
+Loaders read exactly these 20,989,712 bytes. The bundled
+`models/nikola_d12v2_gold.nknn` is 20,989,768 bytes; the 56 bytes after the
+documented end are not read.
 
 ## SCReLU Activation
 
@@ -165,14 +167,14 @@ def forward(features_white, features_black, stm):
     else:         # Black to move
         hidden = concat(screlu(acc_black), screlu(acc_white))  # [512]
 
-    # L2: Dense 512->32 with SCReLU
-    hidden = screlu(W2 @ hidden + B2)  # [32]
+    # L2: Dense 512->32 with SCReLU (W2 is stored [in][out])
+    hidden = screlu(hidden @ W2 + B2)  # [32]
 
     # L3: Dense 32->32 with SCReLU
-    hidden = screlu(W3 @ hidden + B3)  # [32]
+    hidden = screlu(hidden @ W3 + B3)  # [32]
 
     # L4: Dense 32->1 (no activation, raw score)
-    eval_score = W4 @ hidden + B4      # scalar
+    eval_score = hidden @ W4 + B4      # scalar
 
     return eval_score
 ```
