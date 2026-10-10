@@ -1,138 +1,81 @@
-// nnue_cpu_simd.cpp - SIMD-optimized NNUE inference (optimized SIMD)
-// This shows AVX2 SIMD optimization
+// AVX2 NNUE forward pass.
+//
+// Vectorised across output neurons, so every lane performs exactly the scalar
+// reference's sequence of operations: separate multiply and add (no FMA),
+// inputs consumed in index order. The trace is bit-identical to
+// forward_trace() in nnue_cpu.cpp.
 
 #include "nnue_cpu.h"
-#include <immintrin.h>  // AVX2
-#include <cstring>
-#include <cmath>
-#include <algorithm>
 
-// Scalar SCReLU
-inline float screlu(float x) {
-    float clipped = std::max(0.0f, std::min(1.0f, x));
-    return clipped * clipped;
-}
+#include <immintrin.h>
 
-// SIMD-optimized sparse accumulation using AVX2
-void sparse_accum_simd(const NKNNModel& model,
-                       const std::vector<int>& features,
-                       std::array<float, L1_OUTPUT>& out) {
-    // Initialize with bias using SIMD
-    for (int i = 0; i < L1_OUTPUT; i += 8) {
-        __m256 bias = _mm256_loadu_ps(&model.B1_f[i]);
-        _mm256_storeu_ps(&out[i], bias);
-    }
-    
-    // Accumulate feature weights (hot loop)
-    for (int idx : features) {
-        if (idx < 0 || idx >= L1_INPUT) continue;
-        const float* row = &model.W1_f[idx * L1_OUTPUT];
-        
-        for (int i = 0; i < L1_OUTPUT; i += 8) {
-            __m256 acc = _mm256_loadu_ps(&out[i]);
-            __m256 weights = _mm256_loadu_ps(&row[i]);
-            acc = _mm256_add_ps(acc, weights);
-            _mm256_storeu_ps(&out[i], acc);
-        }
-    }
-}
+namespace {
 
-// SIMD SCReLU
-inline __m256 screlu_avx(__m256 x) {
-    __m256 zero = _mm256_setzero_ps();
-    __m256 one = _mm256_set1_ps(1.0f);
-    __m256 clipped = _mm256_max_ps(zero, _mm256_min_ps(one, x));
+inline __m256 screlu8(__m256 x) {
+    const __m256 clipped = _mm256_max_ps(_mm256_setzero_ps(), _mm256_min_ps(_mm256_set1_ps(1.0f), x));
     return _mm256_mul_ps(clipped, clipped);
 }
 
-// SIMD-optimized dense layer
-void dense_layer_simd(int in_size, int out_size,
-                      const float* weights,
-                      const float* bias,
-                      const float* input,
-                      float* output,
-                      bool apply_screlu) {
-    for (int j = 0; j < out_size; j++) {
-        __m256 sum = _mm256_setzero_ps();
-        
-        // Process 8 elements at a time
-        int i = 0;
-        for (; i + 8 <= in_size; i += 8) {
-            __m256 w = _mm256_loadu_ps(&weights[j * in_size + i]);
-            __m256 in = _mm256_loadu_ps(&input[i]);
-            sum = _mm256_fmadd_ps(w, in, sum);
+void accumulate(const NKNNModel& m, const int32_t* features, int count, float* out) {
+    for (int j = 0; j < L1_OUTPUT; j += 8) _mm256_storeu_ps(out + j, _mm256_loadu_ps(&m.B1[j]));
+    for (int f = 0; f < count; f++) {
+        const float* w = &m.W1[static_cast<size_t>(features[f]) * L1_OUTPUT];
+        for (int j = 0; j < L1_OUTPUT; j += 8) {
+            _mm256_storeu_ps(out + j, _mm256_add_ps(_mm256_loadu_ps(out + j), _mm256_loadu_ps(w + j)));
         }
-        
-        // Horizontal sum
-        __m128 hi = _mm256_extractf128_ps(sum, 1);
-        __m128 lo = _mm256_castps256_ps128(sum);
-        __m128 sum128 = _mm_add_ps(lo, hi);
-        sum128 = _mm_hadd_ps(sum128, sum128);
-        sum128 = _mm_hadd_ps(sum128, sum128);
-        float result = _mm_cvtss_f32(sum128) + bias[j];
-        
-        // Handle remainder
-        for (; i < in_size; i++) {
-            result += weights[j * in_size + i] * input[i];
-        }
-        
-        output[j] = apply_screlu ? screlu(result) : result;
     }
 }
 
-float forward_float_simd(const NKNNModel& model,
-                         const std::vector<int>& features_white,
-                         const std::vector<int>& features_black,
-                         int stm) {
-    std::array<float, L1_OUTPUT> acc_white, acc_black;
-    
-    // L1: SIMD sparse accumulation
-    sparse_accum_simd(model, features_white, acc_white);
-    sparse_accum_simd(model, features_black, acc_black);
-    
-    // Concatenate with SCReLU based on STM (SIMD)
-    alignas(32) std::array<float, L2_INPUT> hidden1;
-    
-    if (stm == 0) {  // White to move
-        for (int i = 0; i < L1_OUTPUT; i += 8) {
-            __m256 w = _mm256_loadu_ps(&acc_white[i]);
-            __m256 b = _mm256_loadu_ps(&acc_black[i]);
-            _mm256_storeu_ps(&hidden1[i], screlu_avx(w));
-            _mm256_storeu_ps(&hidden1[L1_OUTPUT + i], screlu_avx(b));
-        }
-    } else {  // Black to move
-        for (int i = 0; i < L1_OUTPUT; i += 8) {
-            __m256 w = _mm256_loadu_ps(&acc_white[i]);
-            __m256 b = _mm256_loadu_ps(&acc_black[i]);
-            _mm256_storeu_ps(&hidden1[i], screlu_avx(b));
-            _mm256_storeu_ps(&hidden1[L1_OUTPUT + i], screlu_avx(w));
-        }
+// out[0..32) = bias + sum_i in[i] * w[i * 32 + j], i ascending, mul then add.
+void dense32(const float* in, int in_size, const float* w, const float* bias, float* out) {
+    __m256 s0 = _mm256_loadu_ps(bias);
+    __m256 s1 = _mm256_loadu_ps(bias + 8);
+    __m256 s2 = _mm256_loadu_ps(bias + 16);
+    __m256 s3 = _mm256_loadu_ps(bias + 24);
+    for (int i = 0; i < in_size; i++) {
+        const __m256 x = _mm256_set1_ps(in[i]);
+        const float* row = w + i * 32;
+        s0 = _mm256_add_ps(s0, _mm256_mul_ps(x, _mm256_loadu_ps(row)));
+        s1 = _mm256_add_ps(s1, _mm256_mul_ps(x, _mm256_loadu_ps(row + 8)));
+        s2 = _mm256_add_ps(s2, _mm256_mul_ps(x, _mm256_loadu_ps(row + 16)));
+        s3 = _mm256_add_ps(s3, _mm256_mul_ps(x, _mm256_loadu_ps(row + 24)));
     }
-    
-    // L2: Dense 512->32
-    alignas(32) std::array<float, L2_OUTPUT> hidden2;
-    dense_layer_simd(L2_INPUT, L2_OUTPUT, model.W2_f.data(), model.B2_f.data(),
-                     hidden1.data(), hidden2.data(), true);
-    
-    // L3: Dense 32->32
-    alignas(32) std::array<float, L3_OUTPUT> hidden3;
-    dense_layer_simd(L2_OUTPUT, L3_OUTPUT, model.W3_f.data(), model.B3_f.data(),
-                     hidden2.data(), hidden3.data(), true);
-    
-    // L4: Dense 32->1 (no activation, use SIMD dot product)
-    __m256 sum = _mm256_setzero_ps();
-    for (int i = 0; i < L3_OUTPUT; i += 8) {
-        __m256 h = _mm256_loadu_ps(&hidden3[i]);
-        __m256 w = _mm256_loadu_ps(&model.W4_f[i]);
-        sum = _mm256_fmadd_ps(h, w, sum);
+    _mm256_storeu_ps(out, s0);
+    _mm256_storeu_ps(out + 8, s1);
+    _mm256_storeu_ps(out + 16, s2);
+    _mm256_storeu_ps(out + 24, s3);
+}
+
+}  // namespace
+
+void forward_trace_avx2(const NKNNModel& m, const int32_t* row, float* trace) {
+    alignas(32) float acc_w[L1_OUTPUT];
+    alignas(32) float acc_b[L1_OUTPUT];
+    accumulate(m, row + WHITE_SLOT, row[1], acc_w);
+    accumulate(m, row + BLACK_SLOT, row[2], acc_b);
+
+    const float* first = row[0] == 0 ? acc_w : acc_b;
+    const float* second = row[0] == 0 ? acc_b : acc_w;
+    alignas(32) float h1[L2_INPUT];
+    for (int j = 0; j < L1_OUTPUT; j += 8) {
+        _mm256_store_ps(h1 + j, screlu8(_mm256_load_ps(first + j)));
+        _mm256_store_ps(h1 + L1_OUTPUT + j, screlu8(_mm256_load_ps(second + j)));
     }
-    
-    // Horizontal sum
-    __m128 hi = _mm256_extractf128_ps(sum, 1);
-    __m128 lo = _mm256_castps256_ps128(sum);
-    __m128 sum128 = _mm_add_ps(lo, hi);
-    sum128 = _mm_hadd_ps(sum128, sum128);
-    sum128 = _mm_hadd_ps(sum128, sum128);
-    
-    return _mm_cvtss_f32(sum128) + model.B4_f;
+
+    float* pre2 = trace + HEADS;
+    float* pre3 = pre2 + L2_OUTPUT;
+    alignas(32) float h2[L2_OUTPUT];
+    dense32(h1, L2_INPUT, m.W2.data(), m.B2.data(), pre2);
+    for (int j = 0; j < L2_OUTPUT; j += 8) _mm256_store_ps(h2 + j, screlu8(_mm256_loadu_ps(pre2 + j)));
+
+    alignas(32) float h3[L3_OUTPUT];
+    dense32(h2, L2_OUTPUT, m.W3.data(), m.B3.data(), pre3);
+    for (int j = 0; j < L3_OUTPUT; j += 8) _mm256_store_ps(h3 + j, screlu8(_mm256_loadu_ps(pre3 + j)));
+
+    // Heads: 4 outputs in one SSE register, WH is [i * 4 + k].
+    __m128 s = _mm_loadu_ps(m.BH.data());
+    for (int i = 0; i < L3_OUTPUT; i++) {
+        s = _mm_add_ps(s, _mm_mul_ps(_mm_set1_ps(h3[i]), _mm_loadu_ps(&m.WH[i * HEADS])));
+    }
+    _mm_storeu_ps(trace, s);
 }

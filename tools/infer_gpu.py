@@ -1,272 +1,160 @@
 #!/usr/bin/env python3
 """
-GPU Inference for NKNN v2 using CUDA kernels.
+GPU inference for NKNN v2 through the native CUDA kernels (ctypes).
 
-Loads native CUDA kernels via ctypes if available.
-Falls back gracefully with documented reason if GPU unavailable.
+Build the kernels first:
+    cmake -S native-cuda -B native-cuda/build && cmake --build native-cuda/build
+
+Every call reports failure explicitly; when no GPU or no compiled library is
+present, get_gpu_status() returns the reason instead of raising.
 """
 
 from __future__ import annotations
-import os
-import sys
+
 import ctypes
-import numpy as np
+import subprocess
+import sys
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
-from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
-# GPU availability status
-_GPU_STATUS: Dict[str, Any] = {
-    "available": False,
-    "blocked_reason": None,
-    "gpu_name": None,
-    "cuda_version": None,
-}
+import numpy as np
 
+sys.path.insert(0, str(Path(__file__).parent))
+from infer_cpu import INPUT_WIDTH, OUTPUTS_PER_POSITION, TRACE_WIDTH, NKNNModel  # noqa: E402
 
-def _detect_gpu() -> Dict[str, Any]:
-    """Detect GPU availability and return status dict."""
-    status = {
-        "available": False,
-        "blocked_reason": None,
-        "gpu_name": None,
-        "cuda_version": None,
-    }
+REPO = Path(__file__).resolve().parent.parent
+LIB_CANDIDATES = [
+    REPO / "native-cuda" / "build" / "nnue_cuda.so",
+    REPO / "native-cuda" / "build" / "nnue_cuda.dll",
+    REPO / "native-cuda" / "build" / "Release" / "nnue_cuda.dll",
+]
+L1, L2, L3 = 256, 32, 32
+API_VERSION = 2
 
-    # Check for NVIDIA GPU via nvidia-smi
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            parts = result.stdout.strip().split(",")
-            status["gpu_name"] = parts[0].strip() if parts else "Unknown"
-            status["cuda_version"] = parts[1].strip() if len(parts) > 1 else "Unknown"
-        else:
-            status["blocked_reason"] = "nvidia-smi failed"
-            return status
-    except FileNotFoundError:
-        status["blocked_reason"] = "nvidia-smi not found"
-        return status
-    except Exception as e:
-        status["blocked_reason"] = f"GPU detection error: {e}"
-        return status
-
-    # Check for compiled CUDA kernels
-    base = Path(__file__).parent.parent / "native-cuda"
-    dll_candidates = [
-        base / "build" / "nnue_cuda.dll",
-        base / "nnue_cuda.dll",
-        base / "build" / "nnue_cuda.so",
-        base / "nnue_cuda.so",
-    ]
-    kernel_path = None
-    for p in dll_candidates:
-        if p.exists():
-            kernel_path = p
-            break
-
-    if kernel_path is None:
-        status["blocked_reason"] = "CUDA kernels not compiled (run build.ps1)"
-        return status
-
-    # Try to load the library
-    try:
-        lib = ctypes.CDLL(str(kernel_path))
-        _setup_lib_signatures(lib)
-        err = lib.nnue_init(0)
-        if err != 0:
-            status["blocked_reason"] = f"CUDA init failed (error {err})"
-            return status
-        status["available"] = True
-        status["_lib"] = lib
-    except OSError as e:
-        status["blocked_reason"] = f"Failed to load CUDA kernels: {e}"
-        return status
-
-    return status
+_P = ctypes.c_void_p
+_I = ctypes.c_int
 
 
-def _setup_lib_signatures(lib):
-    """Set up ctypes function signatures for the CUDA library."""
+class GPUError(RuntimeError):
+    """A CUDA call returned a non-zero error code."""
+
+
+def _find_library() -> Optional[Path]:
+    return next((p for p in LIB_CANDIDATES if p.exists()), None)
+
+
+def _setup(lib: ctypes.CDLL) -> None:
     lib.nnue_get_version.argtypes = []
-    lib.nnue_get_version.restype = ctypes.c_int
-    lib.nnue_init.argtypes = [ctypes.c_int]
-    lib.nnue_init.restype = ctypes.c_int
-    lib.nnue_shutdown.argtypes = []
-    lib.nnue_shutdown.restype = ctypes.c_int
+    lib.nnue_get_version.restype = _I
+    lib.nnue_init.argtypes = [_I]
     lib.nnue_sync.argtypes = []
-    lib.nnue_sync.restype = ctypes.c_int
-    lib.nnue_malloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
-    lib.nnue_malloc.restype = ctypes.c_int
-    lib.nnue_free.argtypes = [ctypes.c_void_p]
-    lib.nnue_free.restype = ctypes.c_int
-    lib.nnue_memcpy_h2d.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
-    lib.nnue_memcpy_h2d.restype = ctypes.c_int
-    lib.nnue_memcpy_d2h.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
-    lib.nnue_memcpy_d2h.restype = ctypes.c_int
-    lib.nnue_sparse_accum.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 2
-    lib.nnue_sparse_accum.restype = ctypes.c_int
-    lib.nnue_dense_layer.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 4
-    lib.nnue_dense_layer.restype = ctypes.c_int
-    lib.nnue_concat_accum.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int]
-    lib.nnue_concat_accum.restype = ctypes.c_int
+    lib.nnue_malloc.argtypes = [ctypes.POINTER(_P), ctypes.c_size_t]
+    lib.nnue_free.argtypes = [_P]
+    lib.nnue_memcpy_h2d.argtypes = [_P, _P, ctypes.c_size_t]
+    lib.nnue_memcpy_d2h.argtypes = [_P, _P, ctypes.c_size_t]
+    lib.nnue_l1.argtypes = [_P, _P, _P, _P, _I]
+    lib.nnue_dense.argtypes = [_P, _P, _P, _P, _P, _I, _I, _I]
+    for name in ("nnue_init", "nnue_sync", "nnue_malloc", "nnue_free", "nnue_memcpy_h2d",
+                 "nnue_memcpy_d2h", "nnue_l1", "nnue_dense"):
+        getattr(lib, name).restype = _I
 
 
 def get_gpu_status() -> Dict[str, Any]:
-    """Get GPU availability status."""
-    global _GPU_STATUS
-    if _GPU_STATUS["blocked_reason"] is None and not _GPU_STATUS["available"]:
-        _GPU_STATUS = _detect_gpu()
-    return {k: v for k, v in _GPU_STATUS.items() if not k.startswith("_")}
-
-
-def is_gpu_available() -> bool:
-    """Check if GPU inference is available."""
-    return get_gpu_status()["available"]
-
-
-@dataclass
-class GPUContext:
-    """GPU context holding device memory and kernels."""
-    lib: Any  # ctypes library
-    # Device memory pointers would go here
-    # For now, using numpy arrays with .ctypes interface
-
-
-L1_SIZE = 256
-MAX_FEATURES = 64
+    """Returns {available, blocked_reason}; never raises."""
+    try:
+        smi = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
+        if smi.returncode != 0:
+            return {"available": False, "blocked_reason": "nvidia-smi failed (no NVIDIA GPU or driver)"}
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return {"available": False, "blocked_reason": f"nvidia-smi unavailable: {exc}"}
+    path = _find_library()
+    if path is None:
+        return {"available": False, "blocked_reason": "CUDA kernels not built (see native-cuda/README.md)"}
+    try:
+        lib = ctypes.CDLL(str(path))
+        _setup(lib)
+    except OSError as exc:
+        return {"available": False, "blocked_reason": f"cannot load {path.name}: {exc}"}
+    if lib.nnue_get_version() != API_VERSION:
+        return {"available": False, "blocked_reason": f"{path.name} is stale; rebuild native-cuda"}
+    err = lib.nnue_init(0)
+    if err != 0:
+        return {"available": False, "blocked_reason": f"cudaSetDevice failed (error {err})"}
+    return {"available": True, "blocked_reason": None, "library": str(path.relative_to(REPO))}
 
 
 class GPUInference:
-    """GPU inference using CUDA kernels."""
+    """Weights resident on the device; buffers sized for one batch and reused."""
 
-    def __init__(self, model):
-        """Initialize GPU inference with model weights."""
-        status = get_gpu_status()
-        if not status["available"]:
-            raise RuntimeError(f"GPU not available: {status['blocked_reason']}")
-        self.model = model
-        self.lib = _GPU_STATUS.get("_lib")
-        self._alloc_weights()
-        self._upload_weights()
+    def __init__(self, model: NKNNModel, batch_size: int):
+        path = _find_library()
+        if path is None:
+            raise GPUError("CUDA kernels not built")
+        self.lib = ctypes.CDLL(str(path))
+        _setup(self.lib)
+        self._check(self.lib.nnue_init(0), "init")
+        self.batch = batch_size
+        self.ptrs: Dict[str, _P] = {}
+        heads_w = np.concatenate([model.W4_q, model.W_wdl_q], axis=1).astype(np.int8)
+        heads_b = np.concatenate([model.B4_q, model.B_wdl_q]).astype(np.int16)
+        host = {
+            "W1": np.ascontiguousarray(model.W1_q, dtype=np.int16),
+            "B1": np.ascontiguousarray(model.B1_q, dtype=np.int16),
+            "W2": np.ascontiguousarray(model.W2_q, dtype=np.int8),
+            "B2": np.ascontiguousarray(model.B2_q, dtype=np.int16),
+            "W3": np.ascontiguousarray(model.W3_q, dtype=np.int8),
+            "B3": np.ascontiguousarray(model.B3_q, dtype=np.int16),
+            "WH": np.ascontiguousarray(heads_w),
+            "BH": np.ascontiguousarray(heads_b),
+        }
+        for name, arr in host.items():
+            self._alloc(name, arr.nbytes)
+            self._check(self.lib.nnue_memcpy_h2d(self.ptrs[name], arr.ctypes.data, arr.nbytes), f"upload {name}")
+        b = batch_size
+        for name, nbytes in (("rows", b * INPUT_WIDTH * 4), ("h1", b * 2 * L1 * 4),
+                             ("pre2", b * L2 * 4), ("h2", b * L2 * 4), ("pre3", b * L3 * 4),
+                             ("h3", b * L3 * 4), ("heads", b * OUTPUTS_PER_POSITION * 4)):
+            self._alloc(name, nbytes)
+        self._check(self.lib.nnue_sync(), "sync")
 
-    def _alloc_weights(self):
-        """Allocate GPU memory for weights."""
-        self.d_W1 = ctypes.c_void_p()
-        self.d_B1 = ctypes.c_void_p()
-        self.d_W2 = ctypes.c_void_p()
-        self.d_B2 = ctypes.c_void_p()
-        self.d_W3 = ctypes.c_void_p()
-        self.d_B3 = ctypes.c_void_p()
-        self.d_W4 = ctypes.c_void_p()
-        self.d_B4 = ctypes.c_void_p()
-        self.lib.nnue_malloc(ctypes.byref(self.d_W1), 40960 * L1_SIZE * 2)
-        self.lib.nnue_malloc(ctypes.byref(self.d_B1), L1_SIZE * 2)
-        self.lib.nnue_malloc(ctypes.byref(self.d_W2), 512 * 32)
-        self.lib.nnue_malloc(ctypes.byref(self.d_B2), 32 * 2)
-        self.lib.nnue_malloc(ctypes.byref(self.d_W3), 32 * 32)
-        self.lib.nnue_malloc(ctypes.byref(self.d_B3), 32 * 2)
-        self.lib.nnue_malloc(ctypes.byref(self.d_W4), 32)
-        self.lib.nnue_malloc(ctypes.byref(self.d_B4), 2)
+    def _check(self, err: int, what: str) -> None:
+        if err != 0:
+            raise GPUError(f"CUDA {what} failed (error {err})")
 
-    def _upload_weights(self):
-        """Upload model weights to GPU."""
-        m = self.model
-        for nm, dp, dt in [("W1_q", self.d_W1, np.int16), ("B1_q", self.d_B1, np.int16),
-                           ("W2_q", self.d_W2, np.int8), ("B2_q", self.d_B2, np.int16),
-                           ("W3_q", self.d_W3, np.int8), ("B3_q", self.d_B3, np.int16),
-                           ("W4_q", self.d_W4, np.int8), ("B4_q", self.d_B4, np.int16)]:
-            a = getattr(m, nm).astype(dt)
-            self.lib.nnue_memcpy_h2d(dp, a.ctypes.data, a.nbytes)
-        self.lib.nnue_sync()
+    def _alloc(self, name: str, nbytes: int) -> None:
+        ptr = _P()
+        self._check(self.lib.nnue_malloc(ctypes.byref(ptr), nbytes), f"malloc {name}")
+        self.ptrs[name] = ptr
 
-    def forward_batch(self, features_white, features_black, stm) -> np.ndarray:
-        """Run GPU inference on a batch of positions."""
-        bs = len(stm)
-        fw = np.zeros((bs, MAX_FEATURES), np.int32)
-        fb = np.zeros((bs, MAX_FEATURES), np.int32)
-        cw = np.zeros(bs, np.int32)
-        cb = np.zeros(bs, np.int32)
-        for i in range(bs):
-            cw[i] = min(len(features_white[i]), MAX_FEATURES)
-            cb[i] = min(len(features_black[i]), MAX_FEATURES)
-            fw[i, :cw[i]] = features_white[i][:cw[i]]
-            fb[i, :cb[i]] = features_black[i][:cb[i]]
-        stm_arr = np.array(stm, np.int32)
+    def forward(self, packed: np.ndarray) -> np.ndarray:
+        """Uploads packed inputs, runs every layer, returns the float32 [N, 68] trace."""
+        n = packed.shape[0]
+        if n > self.batch or packed.shape[1] != INPUT_WIDTH:
+            raise ValueError(f"inputs must be [<= {self.batch}, {INPUT_WIDTH}]")
+        rows = np.ascontiguousarray(packed, dtype=np.int32)
+        p, lib, chk = self.ptrs, self.lib, self._check
+        chk(lib.nnue_memcpy_h2d(p["rows"], rows.ctypes.data, rows.nbytes), "upload rows")
+        chk(lib.nnue_l1(p["W1"], p["B1"], p["rows"], p["h1"], n), "l1")
+        chk(lib.nnue_dense(p["W2"], p["B2"], p["h1"], p["pre2"], p["h2"], n, 2 * L1, L2), "l2")
+        chk(lib.nnue_dense(p["W3"], p["B3"], p["h2"], p["pre3"], p["h3"], n, L2, L3), "l3")
+        chk(lib.nnue_dense(p["WH"], p["BH"], p["h3"], p["heads"], None, n, L3, OUTPUTS_PER_POSITION), "heads")
+        heads = np.empty((n, OUTPUTS_PER_POSITION), np.float32)
+        pre2 = np.empty((n, L2), np.float32)
+        pre3 = np.empty((n, L3), np.float32)
+        for arr, name in ((heads, "heads"), (pre2, "pre2"), (pre3, "pre3")):
+            chk(lib.nnue_memcpy_d2h(arr.ctypes.data, p[name], arr.nbytes), f"download {name}")
+        chk(lib.nnue_sync(), "sync")
+        trace = np.concatenate([heads, pre2, pre3], axis=1)
+        assert trace.shape[1] == TRACE_WIDTH
+        return trace
 
-        # Allocate batch buffers
-        bufs = {}
-        for nm, sz in [("fw", fw.nbytes), ("fb", fb.nbytes), ("cw", cw.nbytes), ("cb", cb.nbytes),
-                       ("stm", stm_arr.nbytes), ("aw", bs * 256 * 4), ("ab", bs * 256 * 4),
-                       ("cat", bs * 512 * 4), ("l2", bs * 32 * 4), ("l3", bs * 32 * 4), ("l4", bs * 4)]:
-            bufs[nm] = ctypes.c_void_p()
-            self.lib.nnue_malloc(ctypes.byref(bufs[nm]), sz)
-
-        # Upload input
-        self.lib.nnue_memcpy_h2d(bufs["fw"], fw.ctypes.data, fw.nbytes)
-        self.lib.nnue_memcpy_h2d(bufs["fb"], fb.ctypes.data, fb.nbytes)
-        self.lib.nnue_memcpy_h2d(bufs["cw"], cw.ctypes.data, cw.nbytes)
-        self.lib.nnue_memcpy_h2d(bufs["cb"], cb.ctypes.data, cb.nbytes)
-        self.lib.nnue_memcpy_h2d(bufs["stm"], stm_arr.ctypes.data, stm_arr.nbytes)
-
-        # Sparse accum
-        self.lib.nnue_sparse_accum(self.d_W1, self.d_B1, bufs["fw"], bufs["cw"], bufs["aw"], bs, MAX_FEATURES)
-        self.lib.nnue_sparse_accum(self.d_W1, self.d_B1, bufs["fb"], bufs["cb"], bufs["ab"], bs, MAX_FEATURES)
-        self.lib.nnue_concat_accum(bufs["aw"], bufs["ab"], bufs["stm"], bufs["cat"], bs)
-
-        # Dense layers
-        self.lib.nnue_dense_layer(self.d_W2, self.d_B2, bufs["cat"], bufs["l2"], bs, 512, 32, 1)
-        self.lib.nnue_dense_layer(self.d_W3, self.d_B3, bufs["l2"], bufs["l3"], bs, 32, 32, 1)
-        self.lib.nnue_dense_layer(self.d_W4, self.d_B4, bufs["l3"], bufs["l4"], bs, 32, 1, 0)
-
-        # Download
-        out = np.zeros(bs, np.float32)
-        self.lib.nnue_memcpy_d2h(out.ctypes.data, bufs["l4"], out.nbytes)
-        self.lib.nnue_sync()
-
-        # Free batch buffers
-        for ptr in bufs.values():
-            self.lib.nnue_free(ptr)
-        return out
-
-    def __del__(self):
-        if hasattr(self, "lib") and self.lib:
-            for a in ["d_W1", "d_B1", "d_W2", "d_B2", "d_W3", "d_B3", "d_W4", "d_B4"]:
-                ptr = getattr(self, a, None)
-                if ptr and ptr.value:
-                    self.lib.nnue_free(ptr)
-
-
-def forward_gpu_batch(model, positions):
-    """GPU batch forward pass."""
-    import time
-    if not is_gpu_available():
-        raise RuntimeError(f"GPU not available: {get_gpu_status()['blocked_reason']}")
-    
-    gpu = GPUInference(model)
-    from infer_cpu import extract_halfkp_features
-    
-    features_w, features_b, stm_list = [], [], []
-    for pos in positions:
-        fw, fb = extract_halfkp_features(pos)
-        features_w.append(fw)
-        features_b.append(fb)
-        stm_list.append(pos.stm)
-    
-    start = time.perf_counter()
-    evals = gpu.forward_batch(features_w, features_b, stm_list)
-    _GPU_STATUS["_lib"].nnue_sync()
-    kernel_time = (time.perf_counter() - start) * 1000
-    return evals, kernel_time
+    def close(self) -> None:
+        for ptr in self.ptrs.values():
+            if ptr.value:
+                self.lib.nnue_free(ptr)
+        self.ptrs = {}
 
 
 if __name__ == "__main__":
-    status = get_gpu_status()
-    print("GPU Status:")
-    for k, v in status.items():
-        print(f"  {k}: {v}")
-    if status["available"]:
-        print(f"CUDA API version: {_GPU_STATUS['_lib'].nnue_get_version()}")
+    for key, value in get_gpu_status().items():
+        print(f"{key}: {value}")

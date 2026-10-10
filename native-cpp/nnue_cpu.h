@@ -1,77 +1,67 @@
 #ifndef NNUE_CPU_H
 #define NNUE_CPU_H
 
+// NKNN v2 NNUE inference, C++ reference (scalar) and AVX2 paths.
+//
+// Numerics contract shared with tools/infer_cpu.py, the CUDA kernels and the
+// MIND kernel: IEEE-754 binary32, every multiply and every add rounded on its
+// own (build with -ffp-contract=off and without FMA), dense sums accumulated
+// in input-index order starting from the bias. Under that contract the
+// per-position trace is bit-identical across all implementations.
+
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <array>
 
-// NKNN v2 model constants
 constexpr int L1_INPUT = 40960;
 constexpr int L1_OUTPUT = 256;
 constexpr int L2_INPUT = 512;
 constexpr int L2_OUTPUT = 32;
 constexpr int L3_OUTPUT = 32;
-constexpr int L4_OUTPUT = 1;
+constexpr int HEADS = 4;  // eval, win, draw, loss
 
-// Quantization scales
+// Per-position verification trace: [eval, win, draw, loss,
+// L2 pre-activation x32, L3 pre-activation x32].
+constexpr int TRACE_WIDTH = HEADS + L2_OUTPUT + L3_OUTPUT;
+
+// Packed input row (int32 x 64): [stm, n_white, n_black,
+// 30 white feature slots, 30 black feature slots, pad].
+constexpr int INPUT_WIDTH = 64;
+constexpr int MAX_FEATURES = 30;
+constexpr int WHITE_SLOT = 3;
+constexpr int BLACK_SLOT = WHITE_SLOT + MAX_FEATURES;
+
 constexpr float SCALE_SPARSE = 128.0f;
 constexpr float SCALE_DENSE_W = 64.0f;
 constexpr float SCALE_DENSE_B = 128.0f;
 
 struct NKNNModel {
-    // Sparse layer (i16)
-    std::vector<int16_t> W1;  // [40960 * 256]
-    std::array<int16_t, L1_OUTPUT> B1;
-    
-    // Dense layers (i8 weights, i16 biases)
-    std::array<int8_t, L2_INPUT * L2_OUTPUT> W2;
-    std::array<int16_t, L2_OUTPUT> B2;
-    
-    std::array<int8_t, L3_OUTPUT * L3_OUTPUT> W3;
-    std::array<int16_t, L3_OUTPUT> B3;
-    
-    std::array<int8_t, L3_OUTPUT> W4;
-    int16_t B4;
-    
-    // Dequantized float weights for CPU inference
-    std::vector<float> W1_f;  // [40960 * 256]
-    std::array<float, L1_OUTPUT> B1_f;
-    std::array<float, L2_INPUT * L2_OUTPUT> W2_f;
-    std::array<float, L2_OUTPUT> B2_f;
-    std::array<float, L3_OUTPUT * L3_OUTPUT> W3_f;
-    std::array<float, L3_OUTPUT> B3_f;
-    std::array<float, L3_OUTPUT> W4_f;
-    float B4_f;
-    
-    bool loaded = false;
+    std::vector<float> W1;                          // [40960 * 256]
+    std::array<float, L1_OUTPUT> B1{};
+    std::array<float, L2_INPUT * L2_OUTPUT> W2{};   // [i * 32 + j]
+    std::array<float, L2_OUTPUT> B2{};
+    std::array<float, L2_OUTPUT * L3_OUTPUT> W3{};  // [i * 32 + j]
+    std::array<float, L3_OUTPUT> B3{};
+    std::array<float, L3_OUTPUT * HEADS> WH{};      // [i * 4 + k], k: eval,w,d,l
+    std::array<float, HEADS> BH{};
 };
 
-struct Position {
-    std::array<int8_t, 64> pieces;  // -1 = empty, 0-4 = WP..WQ, 5=WK, 6-10=BP..BQ, 11=BK
-    int white_king;
-    int black_king;
-    int stm;  // 0 = white, 1 = black
-};
-
-// Load model from file
+// Loads and dequantizes an NKNN v2 file. Returns false on any I/O or format error.
 bool load_nknn(const std::string& path, NKNNModel& model);
 
-// Extract HalfKP features
-void extract_halfkp_features(const Position& pos,
-                             std::vector<int>& features_white,
-                             std::vector<int>& features_black);
+// Loads a packed input file written by tools/infer_cpu.py:write_inputs.
+bool load_inputs(const std::string& path, std::vector<int32_t>& rows, int& count);
 
-// Forward pass (float)
-float forward_float(const NKNNModel& model,
-                    const std::vector<int>& features_white,
-                    const std::vector<int>& features_black,
-                    int stm);
+// Validates one packed row (feature counts and indices in range).
+bool valid_row(const int32_t* row);
 
-// Generate random position
-Position create_random_position(uint64_t seed);
+// Scalar reference forward pass for one packed row; writes TRACE_WIDTH floats.
+void forward_trace(const NKNNModel& model, const int32_t* row, float* trace);
 
-// Compute checksum (same as Python)
-uint32_t compute_checksum(const std::vector<float>& evals);
+#ifdef NNUE_SIMD
+// AVX2 forward pass with the same operation order (bit-identical trace).
+void forward_trace_avx2(const NKNNModel& model, const int32_t* row, float* trace);
+#endif
 
-#endif // NNUE_CPU_H
+#endif  // NNUE_CPU_H

@@ -1,56 +1,91 @@
 #!/usr/bin/env python3
-"""Update README.md benchmark section from LATEST_NNUE.json."""
+"""
+Renders the README results table from a results JSON written by
+tools/run_benchmark.py.
+
+    python tools/update_docs.py                      # rewrite README from results/latest.json
+    python tools/update_docs.py --check              # exit 1 if README is out of date
+    python tools/update_docs.py --results other.json
+"""
 
 from __future__ import annotations
+
+import argparse
 import json
 import re
+import sys
 from pathlib import Path
+from typing import Dict, List
+
+REPO = Path(__file__).resolve().parent.parent
+README = REPO / "README.md"
+DEFAULT_RESULTS = REPO / "results" / "latest.json"
+START, END = "<!-- AUTO:BENCHMARK_START -->", "<!-- AUTO:BENCHMARK_END -->"
+
+
+def render(data: Dict) -> str:
+    rows: List[Dict] = data["results"]
+    base = next((r for r in rows if r["id"] == "cpp" and r["status"] == "verified"), None)
+    lines = [
+        "| Implementation | Device | Best batch (ms) | p50 batch (ms) | Throughput (pos/s) "
+        "| vs C++ scalar | Trace checksum | Bit-identical |",
+        "|---|---|---:|---:|---:|---:|---|---|",
+    ]
+    for r in rows:
+        if r["status"] in ("unavailable", "error"):
+            label = "not run" if r["status"] == "unavailable" else "ERROR"
+            lines.append(f"| {r['implementation']} | {r['device']} | - | - | - | - | - | {label}: {r['reason']} |")
+            continue
+        speedup = (f"{r['throughput_pos_per_s'] / base['throughput_pos_per_s']:.2f}x"
+                   if base else "-")
+        lines.append(
+            f"| {r['implementation']} | {r['device']} | {r['min_ms']:.3f} | {r['p50_ms']:.3f} | "
+            f"{r['throughput_pos_per_s']:,.0f} | {speedup} | `{r['checksum']}` | "
+            f"{'yes' if r['bit_identical'] else 'NO'} |"
+        )
+    cfg, env = data["config"], data["environment"]
+    lines += [
+        "",
+        f"Reference checksum `{data['reference_checksum']}` (batch {cfg['batch']}, seed {cfg['seed']}, "
+        f"{cfg['warmup']} warmup + {cfg['iters']} measured iterations). "
+        f"Run {data['generated_utc'][:10]} with `{data['command']}`.",
+        "",
+        f"Environment: {env['os']}, Python {env['python']}, NumPy {env['numpy']}, "
+        f"{env['cxx'] or 'no C++ compiler'}, {env['nvcc'] or 'no nvcc'}, "
+        f"{env['mindc'] or 'no mindc'}. Throughput uses the fastest measured batch.",
+    ]
+    if data.get("note"):
+        lines += ["", f"Note: {data['note'].rstrip('.')}."]
+    return "\n".join(lines)
 
 
 def main() -> int:
-    repo_root = Path(__file__).parent.parent
-    readme_path = repo_root / "README.md"
-    json_path = repo_root / "bench" / "results" / "LATEST_NNUE.json"
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--results", default=str(DEFAULT_RESULTS))
+    ap.add_argument("--check", action="store_true", help="fail if README differs from the results")
+    args = ap.parse_args()
 
-    if not json_path.exists():
-        print(f"Error: {json_path} not found. Run benchmark first.")
+    data = json.loads(Path(args.results).read_text(encoding="utf-8"))
+    readme = README.read_text(encoding="utf-8")
+    pattern = re.compile(re.escape(START) + r".*?" + re.escape(END), re.DOTALL)
+    if not pattern.search(readme):
+        print(f"README.md has no {START} ... {END} block")
         return 1
+    updated = pattern.sub(lambda _: f"{START}\n{render(data)}\n{END}", readme)
 
-    data = json.loads(json_path.read_text(encoding="utf-8"))
-    results = data["results"]
-    config = data["config"]
-    meta = data["meta"]
-
-    throughput = f"{results['throughput_pos_per_s']:,.0f}"
-    model_name = Path(meta["model_path"]).name
-    timestamp = meta["timestamp_utc"][:10]
-
-    lines = [
-        "| Device | Batch | p50 (ms) | p95 (ms) | Throughput | Checksum |",
-        "|--------|-------|----------|----------|------------|----------|",
-        f"| {results['device'].upper()} | {config['batch_size']} | {results['p50_batch_ms']:.3f} | {results['p95_batch_ms']:.3f} | {throughput} pos/s | {results['checksum']} |",
-        "",
-        f"*Updated: {timestamp} | Model: {model_name}*"
-    ]
-    table = chr(10).join(lines)
-
-    readme_content = readme_path.read_text(encoding="utf-8")
-
-    pattern = r"<!-- AUTO:BENCHMARK_START -->.*?<!-- AUTO:BENCHMARK_END -->"
-    replacement = "<!-- AUTO:BENCHMARK_START -->" + chr(10) + table + chr(10) + "<!-- AUTO:BENCHMARK_END -->"
-
-    new_content = re.sub(pattern, replacement, readme_content, flags=re.DOTALL)
-
-    if new_content == readme_content:
-        print("No changes needed")
+    if args.check:
+        if updated != readme:
+            print("README results table does not match", args.results)
+            return 1
+        print("README results table matches", args.results)
         return 0
-
-    readme_path.write_text(new_content, encoding="utf-8")
-    print(f"Updated README.md from {json_path.name}")
-    print(f"  Throughput: {throughput} pos/s")
-
+    if updated != readme:
+        README.write_text(updated, encoding="utf-8")
+        print("README.md updated from", args.results)
+    else:
+        print("README.md already up to date")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

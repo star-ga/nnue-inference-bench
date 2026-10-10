@@ -1,228 +1,143 @@
 #include "nnue_cpu.h"
-#include <fstream>
-#include <cstring>
-#include <cmath>
+
 #include <algorithm>
+#include <cstring>
+#include <fstream>
 
-// Simple PCG random (same sequence as numpy default_rng)
-class PCG32 {
-    uint64_t state, inc;
-public:
-    PCG32(uint64_t seed) : state(seed), inc(1) {
-        state = state * 6364136223846793005ULL + inc;
-    }
-    uint32_t next() {
-        uint64_t oldstate = state;
-        state = oldstate * 6364136223846793005ULL + inc;
-        uint32_t xorshifted = ((oldstate >> 18u) ^ oldstate) >> 27u;
-        uint32_t rot = oldstate >> 59u;
-        return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
-    }
-    int integers(int low, int high) {
-        return low + (next() % (high - low));
-    }
-};
+namespace {
 
-bool load_nknn(const std::string& path, NKNNModel& model) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) return false;
-    
-    // Check magic
-    uint32_t magic, version;
-    file.read(reinterpret_cast<char*>(&magic), 4);
-    file.read(reinterpret_cast<char*>(&version), 4);
-    
-    if (magic != 0x4E4B4E4E || version != 2) return false;
-    
-    // Read W1 (40960 * 256 i16)
-    model.W1.resize(L1_INPUT * L1_OUTPUT);
-    file.read(reinterpret_cast<char*>(model.W1.data()), L1_INPUT * L1_OUTPUT * 2);
-    
-    // Read B1 (256 i16)
-    file.read(reinterpret_cast<char*>(model.B1.data()), L1_OUTPUT * 2);
-    
-    // Read W2 (512 * 32 i8)
-    file.read(reinterpret_cast<char*>(model.W2.data()), L2_INPUT * L2_OUTPUT);
-    
-    // Read B2 (32 i16)
-    file.read(reinterpret_cast<char*>(model.B2.data()), L2_OUTPUT * 2);
-    
-    // Read W3 (32 * 32 i8)
-    file.read(reinterpret_cast<char*>(model.W3.data()), L3_OUTPUT * L3_OUTPUT);
-    
-    // Read B3 (32 i16)
-    file.read(reinterpret_cast<char*>(model.B3.data()), L3_OUTPUT * 2);
-    
-    // Read W4 (32 i8)
-    file.read(reinterpret_cast<char*>(model.W4.data()), L3_OUTPUT);
-    
-    // Read B4 (1 i16)
-    file.read(reinterpret_cast<char*>(&model.B4), 2);
-    
-    // Dequantize to float
-    model.W1_f.resize(L1_INPUT * L1_OUTPUT);
-    for (size_t i = 0; i < model.W1.size(); i++) {
-        model.W1_f[i] = model.W1[i] / SCALE_SPARSE;
-    }
-    for (int i = 0; i < L1_OUTPUT; i++) {
-        model.B1_f[i] = model.B1[i] / SCALE_SPARSE;
-    }
-    for (size_t i = 0; i < model.W2.size(); i++) {
-        model.W2_f[i] = model.W2[i] / SCALE_DENSE_W;
-    }
-    for (int i = 0; i < L2_OUTPUT; i++) {
-        model.B2_f[i] = model.B2[i] / SCALE_DENSE_B;
-    }
-    for (size_t i = 0; i < model.W3.size(); i++) {
-        model.W3_f[i] = model.W3[i] / SCALE_DENSE_W;
-    }
-    for (int i = 0; i < L3_OUTPUT; i++) {
-        model.B3_f[i] = model.B3[i] / SCALE_DENSE_B;
-    }
-    for (int i = 0; i < L3_OUTPUT; i++) {
-        model.W4_f[i] = model.W4[i] / SCALE_DENSE_W;
-    }
-    model.B4_f = model.B4 / SCALE_DENSE_B;
-    
-    model.loaded = true;
+template <typename T>
+bool read_values(std::ifstream& file, std::vector<T>& out, size_t count) {
+    out.resize(count);
+    file.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(count * sizeof(T)));
+    return static_cast<bool>(file);
+}
+
+template <typename Q, size_t N>
+bool read_dequant(std::ifstream& file, std::array<float, N>& out, size_t count, float scale,
+                  size_t stride = 1, size_t offset = 0) {
+    std::vector<Q> raw;
+    if (!read_values(file, raw, count)) return false;
+    for (size_t i = 0; i < count; i++) out[i * stride + offset] = static_cast<float>(raw[i]) / scale;
     return true;
 }
 
 inline float screlu(float x) {
-    float clipped = std::max(0.0f, std::min(1.0f, x));
+    const float clipped = std::max(0.0f, std::min(1.0f, x));
     return clipped * clipped;
 }
 
-void extract_halfkp_features(const Position& pos,
-                             std::vector<int>& features_white,
-                             std::vector<int>& features_black) {
-    features_white.clear();
-    features_black.clear();
-    
-    for (int sq = 0; sq < 64; sq++) {
-        int piece = pos.pieces[sq];
-        if (piece < 0 || piece == 5 || piece == 11) continue;  // Empty or king
-        
-        int halfkp_piece = (piece < 5) ? piece : piece - 1;
-        
-        // White perspective
-        int w_feat = pos.white_king * 640 + halfkp_piece * 64 + sq;
-        features_white.push_back(w_feat);
-        
-        // Black perspective (flipped)
-        int flipped_sq = sq ^ 56;
-        int flipped_king = pos.black_king ^ 56;
-        int b_halfkp_piece = (halfkp_piece < 5) ? halfkp_piece + 5 : halfkp_piece - 5;
-        int b_feat = flipped_king * 640 + b_halfkp_piece * 64 + flipped_sq;
-        features_black.push_back(b_feat);
-    }
+}  // namespace
+
+bool load_nknn(const std::string& path, NKNNModel& model) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return false;
+
+    uint32_t header[2] = {0, 0};
+    file.read(reinterpret_cast<char*>(header), sizeof(header));
+    if (!file || header[0] != 0x4E4B4E4E || header[1] != 2) return false;
+
+    std::vector<int16_t> w1;
+    if (!read_values(file, w1, static_cast<size_t>(L1_INPUT) * L1_OUTPUT)) return false;
+    model.W1.resize(w1.size());
+    for (size_t i = 0; i < w1.size(); i++) model.W1[i] = static_cast<float>(w1[i]) / SCALE_SPARSE;
+
+    return read_dequant<int16_t>(file, model.B1, L1_OUTPUT, SCALE_SPARSE) &&
+           read_dequant<int8_t>(file, model.W2, L2_INPUT * L2_OUTPUT, SCALE_DENSE_W) &&
+           read_dequant<int16_t>(file, model.B2, L2_OUTPUT, SCALE_DENSE_B) &&
+           read_dequant<int8_t>(file, model.W3, L2_OUTPUT * L3_OUTPUT, SCALE_DENSE_W) &&
+           read_dequant<int16_t>(file, model.B3, L3_OUTPUT, SCALE_DENSE_B) &&
+           // eval head: W4 [32] -> WH[i * 4 + 0], B4 -> BH[0]
+           read_dequant<int8_t>(file, model.WH, L3_OUTPUT, SCALE_DENSE_W, HEADS, 0) &&
+           read_dequant<int16_t>(file, model.BH, 1, SCALE_DENSE_B) &&
+           // WDL head: W_wdl [32 * 3] -> WH[i * 4 + 1 + k], B_wdl -> BH[1 + k]
+           [&] {
+               std::vector<int8_t> wdl;
+               if (!read_values(file, wdl, L3_OUTPUT * 3)) return false;
+               for (int i = 0; i < L3_OUTPUT; i++)
+                   for (int k = 0; k < 3; k++)
+                       model.WH[i * HEADS + 1 + k] = static_cast<float>(wdl[i * 3 + k]) / SCALE_DENSE_W;
+               std::vector<int16_t> bwdl;
+               if (!read_values(file, bwdl, 3)) return false;
+               for (int k = 0; k < 3; k++) model.BH[1 + k] = static_cast<float>(bwdl[k]) / SCALE_DENSE_B;
+               return true;
+           }();
 }
 
-float forward_float(const NKNNModel& model,
-                    const std::vector<int>& features_white,
-                    const std::vector<int>& features_black,
-                    int stm) {
-    // L1: Sparse accumulation
-    std::array<float, L1_OUTPUT> acc_white, acc_black;
-    std::copy(model.B1_f.begin(), model.B1_f.end(), acc_white.begin());
-    std::copy(model.B1_f.begin(), model.B1_f.end(), acc_black.begin());
-    
-    for (int idx : features_white) {
-        if (idx >= 0 && idx < L1_INPUT) {
-            for (int j = 0; j < L1_OUTPUT; j++) {
-                acc_white[j] += model.W1_f[idx * L1_OUTPUT + j];
-            }
-        }
+bool load_inputs(const std::string& path, std::vector<int32_t>& rows, int& count) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return false;
+    char magic[4];
+    uint32_t header[3] = {0, 0, 0};  // version, count, width
+    file.read(magic, 4);
+    file.read(reinterpret_cast<char*>(header), sizeof(header));
+    if (!file || std::memcmp(magic, "NKIN", 4) != 0 || header[0] != 1 || header[2] != INPUT_WIDTH ||
+        header[1] == 0 || header[1] > (1u << 20)) {
+        return false;
     }
-    
-    for (int idx : features_black) {
-        if (idx >= 0 && idx < L1_INPUT) {
-            for (int j = 0; j < L1_OUTPUT; j++) {
-                acc_black[j] += model.W1_f[idx * L1_OUTPUT + j];
-            }
-        }
+    count = static_cast<int>(header[1]);
+    if (!read_values(file, rows, static_cast<size_t>(count) * INPUT_WIDTH)) return false;
+    for (int p = 0; p < count; p++) {
+        if (!valid_row(&rows[static_cast<size_t>(p) * INPUT_WIDTH])) return false;
     }
-    
-    // Concatenate with SCReLU based on STM
-    std::array<float, L2_INPUT> hidden1;
-    if (stm == 0) {  // White to move
-        for (int i = 0; i < L1_OUTPUT; i++) {
-            hidden1[i] = screlu(acc_white[i]);
-            hidden1[L1_OUTPUT + i] = screlu(acc_black[i]);
-        }
-    } else {  // Black to move
-        for (int i = 0; i < L1_OUTPUT; i++) {
-            hidden1[i] = screlu(acc_black[i]);
-            hidden1[L1_OUTPUT + i] = screlu(acc_white[i]);
-        }
+    return true;
+}
+
+bool valid_row(const int32_t* row) {
+    const int32_t nw = row[1];
+    const int32_t nb = row[2];
+    if (row[0] < 0 || row[0] > 1 || nw < 0 || nw > MAX_FEATURES || nb < 0 || nb > MAX_FEATURES) return false;
+    for (int f = 0; f < nw; f++) {
+        if (row[WHITE_SLOT + f] < 0 || row[WHITE_SLOT + f] >= L1_INPUT) return false;
     }
-    
-    // L2: Dense 512->32
-    std::array<float, L2_OUTPUT> hidden2;
+    for (int f = 0; f < nb; f++) {
+        if (row[BLACK_SLOT + f] < 0 || row[BLACK_SLOT + f] >= L1_INPUT) return false;
+    }
+    return true;
+}
+
+void forward_trace(const NKNNModel& m, const int32_t* row, float* trace) {
+    std::array<float, L1_OUTPUT> acc_w, acc_b;
+    std::copy(m.B1.begin(), m.B1.end(), acc_w.begin());
+    std::copy(m.B1.begin(), m.B1.end(), acc_b.begin());
+
+    for (int f = 0; f < row[1]; f++) {
+        const float* w = &m.W1[static_cast<size_t>(row[WHITE_SLOT + f]) * L1_OUTPUT];
+        for (int j = 0; j < L1_OUTPUT; j++) acc_w[j] += w[j];
+    }
+    for (int f = 0; f < row[2]; f++) {
+        const float* w = &m.W1[static_cast<size_t>(row[BLACK_SLOT + f]) * L1_OUTPUT];
+        for (int j = 0; j < L1_OUTPUT; j++) acc_b[j] += w[j];
+    }
+
+    const bool white_first = row[0] == 0;
+    std::array<float, L2_INPUT> h1;
+    for (int j = 0; j < L1_OUTPUT; j++) {
+        h1[j] = screlu(white_first ? acc_w[j] : acc_b[j]);
+        h1[L1_OUTPUT + j] = screlu(white_first ? acc_b[j] : acc_w[j]);
+    }
+
+    float* pre2 = trace + HEADS;
+    float* pre3 = pre2 + L2_OUTPUT;
+    std::array<float, L2_OUTPUT> h2;
     for (int j = 0; j < L2_OUTPUT; j++) {
-        float sum = model.B2_f[j];
-        for (int i = 0; i < L2_INPUT; i++) {
-            sum += hidden1[i] * model.W2_f[i * L2_OUTPUT + j];
-        }
-        hidden2[j] = screlu(sum);
+        float s = m.B2[j];
+        for (int i = 0; i < L2_INPUT; i++) s += h1[i] * m.W2[i * L2_OUTPUT + j];
+        pre2[j] = s;
+        h2[j] = screlu(s);
     }
-    
-    // L3: Dense 32->32
-    std::array<float, L3_OUTPUT> hidden3;
+
+    std::array<float, L3_OUTPUT> h3;
     for (int j = 0; j < L3_OUTPUT; j++) {
-        float sum = model.B3_f[j];
-        for (int i = 0; i < L2_OUTPUT; i++) {
-            sum += hidden2[i] * model.W3_f[i * L3_OUTPUT + j];
-        }
-        hidden3[j] = screlu(sum);
+        float s = m.B3[j];
+        for (int i = 0; i < L2_OUTPUT; i++) s += h2[i] * m.W3[i * L3_OUTPUT + j];
+        pre3[j] = s;
+        h3[j] = screlu(s);
     }
-    
-    // L4: Dense 32->1 (no activation)
-    float eval_score = model.B4_f;
-    for (int i = 0; i < L3_OUTPUT; i++) {
-        eval_score += hidden3[i] * model.W4_f[i];
-    }
-    
-    return eval_score;
-}
 
-Position create_random_position(uint64_t seed) {
-    PCG32 rng(seed);
-    Position pos;
-    std::fill(pos.pieces.begin(), pos.pieces.end(), -1);
-    
-    pos.white_king = rng.integers(0, 64);
-    pos.black_king = rng.integers(0, 64);
-    while (pos.black_king == pos.white_king ||
-           (std::abs(pos.black_king / 8 - pos.white_king / 8) <= 1 &&
-            std::abs(pos.black_king % 8 - pos.white_king % 8) <= 1)) {
-        pos.black_king = rng.integers(0, 64);
+    for (int k = 0; k < HEADS; k++) {
+        float s = m.BH[k];
+        for (int i = 0; i < L3_OUTPUT; i++) s += h3[i] * m.WH[i * HEADS + k];
+        trace[k] = s;
     }
-    
-    pos.pieces[pos.white_king] = 5;
-    pos.pieces[pos.black_king] = 11;
-    
-    int num_pieces = rng.integers(4, 16);
-    int piece_types[] = {0, 1, 2, 3, 4, 6, 7, 8, 9, 10};
-    
-    for (int i = 0; i < num_pieces; i++) {
-        int sq = rng.integers(0, 64);
-        if (pos.pieces[sq] == -1) {
-            pos.pieces[sq] = piece_types[rng.next() % 10];
-        }
-    }
-    
-    pos.stm = rng.integers(0, 2);
-    return pos;
-}
-
-uint32_t compute_checksum(const std::vector<float>& evals) {
-    // MD5 of float array, take first 8 hex chars
-    // Simplified: use same XOR approach as reference
-    uint32_t result = 0;
-    for (float e : evals) {
-        int32_t q = static_cast<int32_t>(std::round(e * 10000.0f));
-        result ^= static_cast<uint32_t>(q);
-    }
-    return result;
 }
