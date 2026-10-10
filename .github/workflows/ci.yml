@@ -2,40 +2,38 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [master]
   pull_request:
 
-jobs:
-  test-linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Install dependencies
-        run: pip install numpy
-      - name: Smoke test (CPU inference)
-        run: python tools/smoke_cpu.py
-      - name: Run CPU benchmark
-        run: python tools/run_benchmark.py --device cpu -o bench/results/ci_cpu.json
-      - name: Validate checksum
-        run: python tools/validate_results.py bench/results/ci_cpu.json
-      - name: Validate README claims
-        run: python tools/validate_claims.py
+permissions:
+  contents: read
 
-  test-windows:
-    runs-on: windows-latest
+jobs:
+  cpu:
+    name: CPU paths (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
-          python-version: '3.11'
-      - name: Install dependencies
-        run: pip install numpy
-      - name: Smoke test (CPU inference)
+          python-version: '3.14'
+      - name: Install NumPy
+        run: python -m pip install --upgrade numpy
+      - name: Reference smoke test
         run: python tools/smoke_cpu.py
-      - name: Run CPU benchmark
-        run: python tools/run_benchmark.py --device cpu -o bench/results/ci_cpu.json
-      - name: Validate checksum
-        run: python tools/validate_results.py bench/results/ci_cpu.json
+      - name: Build C++ scalar and AVX2
+        run: |
+          cmake -S native-cpp -B native-cpp/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build native-cpp/build --config Release
+      - name: Run and verify (bit identity)
+        run: python tools/run_benchmark.py --impl python,cpp,simd --require python,cpp,simd --warmup 1 --iters 5 -o build/work/ci.json
+      - name: Validate against pinned checksum
+        run: python tools/validate_results.py build/work/ci.json
+      - name: Committed results and README agree
+        run: |
+          python tools/validate_results.py results/latest.json
+          python tools/update_docs.py --check

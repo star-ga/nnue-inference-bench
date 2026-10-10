@@ -1,47 +1,31 @@
-name: GPU Benchmark (Self-Hosted)
+name: GPU Benchmark (self-hosted)
 
+# Manual only: needs a self-hosted runner with an NVIDIA GPU, a CUDA toolkit
+# and (for the MIND row) a mindc built from star-ga/mind main.
 on:
   workflow_dispatch:
-    inputs:
-      run_full:
-        description: 'Run full benchmark (50 iters)'
-        required: false
-        default: 'false'
-  schedule:
-    # Run weekly on Sunday at 00:00 UTC
-    - cron: '0 0 * * 0'
+
+permissions:
+  contents: read
 
 jobs:
   gpu-benchmark:
-    runs-on: [self-hosted, gpu, windows]
+    runs-on: [self-hosted, gpu]
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Check GPU availability
-        run: nvidia-smi
-
-      - name: Install Python dependencies
-        run: pip install numpy
-
-      - name: Build CUDA kernels
+      - uses: actions/checkout@v7
+      - name: Install NumPy
+        run: python3 -m pip install --upgrade numpy
+      - name: Build C++ and CUDA
         run: |
-          cd native-cuda
-          powershell -ExecutionPolicy Bypass -File build.ps1
-
-      - name: Build C++ SIMD (Mind CPU)
-        run: |
-          cd native-cpp
-          powershell -ExecutionPolicy Bypass -File build_simd.ps1
-
-      - name: Run full benchmark
-        run: |
-          python tools/run_benchmark.py --device all -o bench/results/gpu_benchmark.json
-
-      - name: Validate all checksums
-        run: python tools/validate_results.py bench/results/gpu_benchmark.json
-
-      - name: Upload results
-        uses: actions/upload-artifact@v4
+          cmake -S native-cpp -B native-cpp/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build native-cpp/build --config Release
+          cmake -S native-cuda -B native-cuda/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build native-cuda/build --config Release
+      - name: Run and verify
+        run: python3 tools/run_benchmark.py --require python,cpp,simd,cuda -o build/work/gpu.json
+      - name: Validate against pinned checksum
+        run: python3 tools/validate_results.py build/work/gpu.json
+      - uses: actions/upload-artifact@v7
         with:
           name: gpu-benchmark-results
-          path: bench/results/gpu_benchmark.json
+          path: build/work/gpu.json

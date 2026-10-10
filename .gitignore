@@ -1,20 +1,16 @@
-# build artifacts
+# build artifacts (CMake trees, MIND library, benchmark scratch files)
 build/
 out/
 dist/
 *.log
 *.tmp
+*.obj
 
 # python
 .venv/
 __pycache__/
 *.pyc
 
-# results
-bench/results/
-runs/
-
 # OS
 .DS_Store
 Thumbs.db
-*.obj
