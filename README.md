@@ -162,6 +162,12 @@ results/          Committed results behind the README table
 docs/             Architecture and methodology notes
 ```
 
+## Community
+
+- **Discussions:** <https://github.com/star-ga/mind/discussions> — questions,
+  ideas and help for nnue-inference-bench and the wider MIND ecosystem.
+- **Discord:** <https://mindlang.dev/discord> — the MindLang community server.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
