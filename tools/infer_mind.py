@@ -6,7 +6,7 @@ drives it through the static-shape tensor C ABI (ctypes).
 Each 1-D tensor parameter is passed as the unpacked memref descriptor
 (alloc_ptr, aligned_ptr, offset, size, stride).
 
-Requires a MIND 0.10.x compiler (`mindc` on PATH or in $MINDC) built with
+Requires a MIND 0.10.4 compiler (`mindc` on PATH or in $MINDC) built with
 the MLIR backend, plus the LLVM/MLIR command-line tools it invokes.
 """
 
@@ -57,7 +57,7 @@ def build(force: bool = False) -> Path:
     """Compile mind/nnue.mind to a shared library (skipped when up to date)."""
     mindc = find_mindc()
     if mindc is None:
-        raise MindUnavailable("mindc not found (install MIND 0.10.x or set MINDC)")
+        raise MindUnavailable("mindc not found (install MIND 0.10.4 or set MINDC)")
     version = mindc_version(mindc)
     if SUPPORTED_SERIES not in version:
         raise MindUnavailable(f"need MIND {SUPPORTED_SERIES}x, found: {version}")

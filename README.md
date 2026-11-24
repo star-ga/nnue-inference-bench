@@ -39,7 +39,7 @@ timing is reported.
 ## Quick start
 
 Requirements: Python 3.11+ with NumPy, CMake 3.24+, a C++17 compiler.
-Optional: a MIND 0.10.x compiler (see above) with the LLVM/MLIR tools it calls,
+Optional: a MIND 0.10.4 compiler (see above) with the LLVM/MLIR tools it calls,
 and a CUDA toolkit with an NVIDIA GPU.
 
 ```bash
